@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+google-generativeai
+pandas
+python-multipart
+pymupdf
+rich
+chromadb
+pydantic-settings
+python-dotenv
+Pillow
