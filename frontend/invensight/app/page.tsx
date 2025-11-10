@@ -28,7 +28,7 @@ export default function Home() {
   }, []);
 
   return (
-    <div className="relative flex min-h-screen items-center justify-center font-sans bg-black dark:bg-black">
+    <main className="relative flex min-h-screen w-full items-center justify-center font-sans bg-black dark:bg-black">
       <div className="w-full h-screen">
         <ColorBends
         rotation={180}
@@ -40,7 +40,7 @@ export default function Home() {
       
       {/* GitHub Logo */}
       <a 
-        href="https://github.com/yourusername/invensight"
+        href="https://github.com/tshrrx/InvenSight"
         target="_blank"
         rel="noopener noreferrer"
         className="absolute top-8 right-8 z-20 p-3 rounded-full text-white hover:text-gray-300 transition-all duration-300 ring-2 ring-offset-2 ring-offset-black animate-[pulse_3s_ease-in-out_infinite]"
@@ -90,6 +90,6 @@ export default function Home() {
           </Link>
         </div>
       </div>
-    </div>
+    </main>
   );
 }

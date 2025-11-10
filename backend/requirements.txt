@@ -9,3 +9,5 @@ chromadb
 pydantic-settings
 python-dotenv
 Pillow
+boto3
+pinecone
