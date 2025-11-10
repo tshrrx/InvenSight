@@ -5,7 +5,7 @@ import ColorBends from './components/ColorBends';
 import TextType from './components/TextType';
 import Link from 'next/link';
 import { useState, useEffect } from 'react';
-import { Button } from '@/components/ui/button';
+import { Button } from '@/app/components/ui/button';
 import { Plus_Jakarta_Sans } from 'next/font/google';
 
 const plusJakartaSans = Plus_Jakarta_Sans({ subsets: ['latin'] });
