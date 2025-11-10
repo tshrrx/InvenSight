@@ -77,7 +77,7 @@ export default function Home() {
               />
             )}
           </div>
-          <Link href="/main" className="mt-8">
+          <Link href="/mainChat" className="mt-8">
             <Button
               size="icon"
               variant="outline"

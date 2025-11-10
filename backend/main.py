@@ -26,7 +26,7 @@ app = FastAPI(
 # Add CORS middleware (should already be there)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["http://localhost:3000","https://invensight.vercel.app"],  # Allows all origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
