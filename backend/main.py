@@ -8,9 +8,9 @@ from typing import List, Dict
 
 # Import our custom processing functions
 from processing import (
-    process_user_files, 
-    query_user_data, 
-    list_user_files, 
+    process_user_files,
+    query_user_data,
+    list_user_files,
     delete_user_file,
     TEMP_DIR,
     text_index,
@@ -23,21 +23,18 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# Add CORS middleware (should already be there)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000","https://invensight.vercel.app"],  # Allows all origins
+    allow_origins=["http://localhost:3000", "https://invensight.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global dictionary to track processing status
+# Global processing status
 processing_status: Dict[str, str] = {}
 
-# Helper Function
 def save_upload_file_temp(upload_file: UploadFile) -> Path:
-    """Saves an uploaded file to temp directory."""
     temp_path = TEMP_DIR / upload_file.filename
     try:
         with temp_path.open("wb") as buffer:
@@ -46,16 +43,15 @@ def save_upload_file_temp(upload_file: UploadFile) -> Path:
     finally:
         upload_file.file.close()
 
-# Pydantic Models
 class QueryRequest(BaseModel):
     user_id: str
     query: str
-    
+
 class UploadResponse(BaseModel):
     message: str
     user_id: str
     filename: str
-    
+
 class QueryResponse(BaseModel):
     user_id: str
     query: str
@@ -75,11 +71,8 @@ class ProcessingStatus(BaseModel):
     status: str
     message: str
 
-# --- API Endpoints ---
-
 @app.get("/", response_model=HealthResponse)
 def read_root():
-    """Root endpoint with API information."""
     return HealthResponse(
         status="healthy",
         message="Welcome to InvenSight Multimodal RAG API with Pinecone + S3. Go to /docs for API documentation."
@@ -87,11 +80,7 @@ def read_root():
 
 @app.get("/health", response_model=HealthResponse)
 def health_check():
-    """Health check endpoint for monitoring."""
-    return HealthResponse(
-        status="healthy",
-        message="Service is running with Pinecone and S3"
-    )
+    return HealthResponse(status="healthy", message="Service appears healthy")
 
 @app.post("/upload/", response_model=UploadResponse)
 async def upload_pdf(
@@ -99,21 +88,14 @@ async def upload_pdf(
     user_id: str = Form(...),
     file: UploadFile = File(...)
 ):
-    """
-    Uploads a PDF file for a specific user.
-    Stores PDF in S3 and embeddings in Pinecone.
-    """
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
-    
-    # Save temporarily
+
     temp_file = save_upload_file_temp(file)
-    
-    # Mark as processing
+
     status_key = f"{user_id}_{file.filename}"
     processing_status[status_key] = "processing"
-    
-    # Define processing function with status updates
+
     def process_with_status():
         try:
             process_user_files(user_id=user_id, pdf_path=temp_file)
@@ -123,60 +105,46 @@ async def upload_pdf(
             processing_status[status_key] = f"failed: {str(e)}"
             print(f"Processing failed for {status_key}: {e}")
         finally:
-            # Clean up temp file
             try:
                 temp_file.unlink(missing_ok=True)
             except Exception as e:
                 print(f"Error deleting temp file: {e}")
-    
-    # Process in background
+
     background_tasks.add_task(process_with_status)
-    
+
     return UploadResponse(
-        message="File uploaded successfully. Processing started in the background.",
+        message="File uploaded; processing started.",
         user_id=user_id,
         filename=file.filename
     )
 
 @app.get("/upload/status/{user_id}/{filename}", response_model=ProcessingStatus)
 async def check_upload_status(user_id: str, filename: str):
-    """Check if a file has finished processing."""
     status_key = f"{user_id}_{filename}"
     status = processing_status.get(status_key, "not_found")
-    
     if status == "not_found":
         message = "No processing record found for this file"
     elif status == "processing":
-        message = "File is currently being processed. Please wait..."
+        message = "File is currently being processed"
     elif status == "completed":
         message = "File processing completed successfully"
     elif status.startswith("failed"):
         message = status
     else:
         message = status
-    
     return ProcessingStatus(status=status, message=message)
 
 @app.post("/query/", response_model=QueryResponse)
 async def query(request: QueryRequest):
-    """
-    Queries the uploaded data for a specific user from Pinecone.
-    """
     try:
         answer = query_user_data(user_id=request.user_id, query=request.query)
-        
-        return QueryResponse(
-            user_id=request.user_id,
-            query=request.query,
-            answer=answer
-        )
+        return QueryResponse(user_id=request.user_id, query=request.query, answer=answer)
     except Exception as e:
         print(f"Error during query: {e}")
         raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
 
 @app.get("/users/{user_id}/files", response_model=List[FileInfo])
 async def get_user_files(user_id: str):
-    """Lists all files uploaded by a user."""
     try:
         files = list_user_files(user_id)
         return files
@@ -185,11 +153,9 @@ async def get_user_files(user_id: str):
 
 @app.delete("/users/{user_id}/files/{file_name}")
 async def delete_file(user_id: str, file_name: str):
-    """Deletes a specific file and its embeddings."""
     try:
         success = delete_user_file(user_id, file_name)
         if success:
-            # Also remove from processing_status if exists
             status_key = f"{user_id}_{file_name}"
             processing_status.pop(status_key, None)
             return {"message": f"Successfully deleted {file_name}"}
@@ -200,12 +166,10 @@ async def delete_file(user_id: str, file_name: str):
 
 @app.get("/debug/user/{user_id}")
 async def debug_user_data(user_id: str):
-    """Debug endpoint to check user's data in Pinecone."""
     try:
-        # Get stats from Pinecone
         text_stats = text_index.describe_index_stats()
         image_stats = image_index.describe_index_stats()
-        
+
         return {
             "user_id": user_id,
             "text_index": {

@@ -1,5 +1,5 @@
 import os
-import fitz  # This is pymupdf
+import fitz  # pymupdf
 import io
 from PIL import Image
 from pathlib import Path
@@ -9,13 +9,12 @@ import boto3
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 import hashlib
-import json
+import time
 from typing import List, Dict
-import tempfile  # Add this with other imports
 
 load_dotenv()
 
-# API Keys
+# API Keys & config
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "us-east-1")
@@ -39,14 +38,17 @@ genai.configure(api_key=GEMINI_API_KEY)
 # --- Configuration ---
 GENERATION_MODEL_NAME = "gemini-2.5-flash"
 EMBEDDING_MODEL_NAME = "models/text-embedding-004"
-EMBEDDING_DIMENSION = 768  # Google's text-embedding-004 dimension
+EMBEDDING_DIMENSION = 768  # expected dimension of the embedding model
+CHUNK_SIZE = 800           # approx characters per chunk (adjustable)
+CHUNK_OVERLAP = 150        # overlap in characters
+UPSERT_BATCH = 100         # how many vectors to upsert per request
 
-# Local temp directory for processing (will be cleaned up)
+# Local temp directory
 DATA_DIR = Path(os.getenv("DATA_DIR", "."))
 TEMP_DIR = DATA_DIR / "temp"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-# Initialize Google AI
+# Initialize Google AI generation model
 try:
     generation_model = genai.GenerativeModel(GENERATION_MODEL_NAME)
 except Exception as e:
@@ -56,13 +58,12 @@ except Exception as e:
 # Initialize Pinecone
 try:
     pc = Pinecone(api_key=PINECONE_API_KEY)
-    
-    # Create indexes if they don't exist
+
     index_name_text = "invensight-text"
     index_name_images = "invensight-images"
-    
+
     existing_indexes = [index.name for index in pc.list_indexes()]
-    
+
     if index_name_text not in existing_indexes:
         pc.create_index(
             name=index_name_text,
@@ -70,7 +71,7 @@ try:
             metric="cosine",
             spec=ServerlessSpec(cloud="aws", region=PINECONE_ENVIRONMENT)
         )
-    
+
     if index_name_images not in existing_indexes:
         pc.create_index(
             name=index_name_images,
@@ -78,10 +79,10 @@ try:
             metric="cosine",
             spec=ServerlessSpec(cloud="aws", region=PINECONE_ENVIRONMENT)
         )
-    
+
     text_index = pc.Index(index_name_text)
     image_index = pc.Index(index_name_images)
-    
+
     print("Pinecone initialized successfully")
 except Exception as e:
     print(f"Error initializing Pinecone: {e}")
@@ -95,8 +96,7 @@ try:
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
         region_name=AWS_REGION
     )
-    
-    # Check if bucket exists, create if not
+
     try:
         s3_client.head_bucket(Bucket=S3_BUCKET_NAME)
     except ClientError:
@@ -104,39 +104,66 @@ try:
             Bucket=S3_BUCKET_NAME,
             CreateBucketConfiguration={'LocationConstraint': AWS_REGION} if AWS_REGION != 'us-east-1' else {}
         )
-    
+
     print("S3 initialized successfully")
 except Exception as e:
     print(f"Error initializing S3: {e}")
     raise
 
-# --- Image Description Prompt ---
-IMAGE_DESCRIPTION_PROMPT = """Explain what is going on in the image.
-If it's a table, extract all elements of the table.
-If it's a graph, explain the findings in the graph.
-Do not include any numbers that are not mentioned in the image.
-"""
+# --- Utilities ---
 
-def get_image_description(pil_image):
-    """Generates a text description for a PIL image."""
-    try:
-        response = generation_model.generate_content([IMAGE_DESCRIPTION_PROMPT, pil_image])
-        return response.text
-    except Exception as e:
-        print(f"Error generating image description: {e}")
-        return ""
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
+    """
+    Split text into chunks of approximately chunk_size characters with overlap.
+    Keeps sentences reasonably intact by splitting on sentence boundaries when possible.
+    """
+    if not text:
+        return []
 
-def get_text_embedding(text):
-    """Generates an embedding for a piece of text."""
-    try:
-        result = genai.embed_content(model=EMBEDDING_MODEL_NAME, content=text)
-        return result['embedding']
-    except Exception as e:
-        print(f"Error generating text embedding: {e}")
-        return None
+    # Normalize whitespace
+    txt = " ".join(text.split())
+    # Try to split on common sentence separators to preserve sentence boundaries
+    import re
+    sentences = re.split(r'(?<=[\.\?\!])\s+', txt)
+    chunks = []
+    current = ""
+    for sent in sentences:
+        if len(current) + len(sent) + 1 <= chunk_size:
+            current = (current + " " + sent).strip()
+        else:
+            if current:
+                chunks.append(current)
+            # If sentence itself larger than chunk_size, break it forcefully
+            if len(sent) > chunk_size:
+                # break into raw substrings
+                start = 0
+                while start < len(sent):
+                    chunks.append(sent[start:start + chunk_size].strip())
+                    start += chunk_size - overlap
+                current = ""
+            else:
+                current = sent
+    if current:
+        chunks.append(current)
+
+    # Add explicit overlap windows to improve retrieval context continuity
+    if overlap and len(chunks) > 1:
+        overlapped = []
+        for i in range(len(chunks)):
+            start_idx = max(0, i - 1)
+            window = " ".join(chunks[start_idx:i+1])
+            overlapped.append(window)
+        return overlapped
+    return chunks
+
+def generate_file_hash(file_path: Path) -> str:
+    hash_md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
 
 def upload_to_s3(file_path: Path, s3_key: str) -> str:
-    """Uploads a file to S3 and returns the S3 URI."""
     try:
         s3_client.upload_file(str(file_path), S3_BUCKET_NAME, s3_key)
         s3_uri = f"s3://{S3_BUCKET_NAME}/{s3_key}"
@@ -147,7 +174,6 @@ def upload_to_s3(file_path: Path, s3_key: str) -> str:
         return ""
 
 def download_from_s3(s3_key: str, local_path: Path) -> bool:
-    """Downloads a file from S3 to local path."""
     try:
         s3_client.download_file(S3_BUCKET_NAME, s3_key, str(local_path))
         print(f"Downloaded {s3_key} from S3")
@@ -156,57 +182,86 @@ def download_from_s3(s3_key: str, local_path: Path) -> bool:
         print(f"Error downloading from S3: {e}")
         return False
 
-def generate_file_hash(file_path: Path) -> str:
-    """Generates MD5 hash of a file to track if it's already processed."""
-    hash_md5 = hashlib.md5()
-    with open(file_path, "rb") as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            hash_md5.update(chunk)
-    return hash_md5.hexdigest()
+# --- Embeddings with retries and validation ---
+def get_text_embedding(text: str, retries: int = 3, backoff: float = 1.0):
+    """Stable embedding generator with retries and dimension check."""
+    if not text:
+        return None
+    for attempt in range(1, retries + 1):
+        try:
+            result = genai.embed_content(model=EMBEDDING_MODEL_NAME, content=text)
+            embedding = result.get('embedding')
+            if not embedding:
+                raise ValueError("No 'embedding' in response")
+            if len(embedding) != EMBEDDING_DIMENSION:
+                print(f"⚠️ Embedding dimension mismatch: expected {EMBEDDING_DIMENSION}, got {len(embedding)}")
+                # continue to retry once or fall back
+                time.sleep(backoff * attempt)
+                continue
+            return embedding
+        except Exception as e:
+            print(f"Embedding attempt {attempt} failed: {e}")
+            time.sleep(backoff * attempt)
+    print("Failed to generate embedding after retries.")
+    return None
 
-def delete_user_embeddings(user_id: str):
-    """Deletes all embeddings for a user from Pinecone."""
+# --- Image description ---
+IMAGE_DESCRIPTION_PROMPT = """Explain what is going on in the image.
+If it's a table, extract the table content as text.
+If it's a graph, explain the findings in the graph.
+Do not invent numbers not present in the image.
+Keep description concise (max 200 words).
+"""
+
+def get_image_description(pil_image: Image.Image):
     try:
-        # Delete from text index
-        text_index.delete(filter={"user_id": user_id})
-        # Delete from image index
-        image_index.delete(filter={"user_id": user_id})
-        print(f"Deleted all embeddings for user: {user_id}")
+        # Keep it text-only for metadata; generation_model may accept images depending on SDK.
+        # If SDK supports multimodal input, the SDK call may vary — this keeps it robust.
+        response = generation_model.generate_content([IMAGE_DESCRIPTION_PROMPT, pil_image])
+        return response.text.strip()
     except Exception as e:
-        print(f"Error deleting embeddings: {e}")
+        print(f"Error generating image description: {e}")
+        return ""
 
+# --- Processing pipeline ---
 def process_user_files(user_id: str, pdf_path: Path):
     """
-    Processes a single uploaded PDF for a user.
-    Stores PDF in S3 and embeddings in Pinecone.
+    Processes a single uploaded PDF:
+    - Upload PDF to S3
+    - Chunk text and embed each chunk with metadata
+    - Extract images, describe them, embed descriptions
+    - Batch upsert vectors to Pinecone
     """
     print(f"Starting processing for user: {user_id}, file: {pdf_path.name}")
-    
-    # Generate file hash to avoid duplicate processing
+
     file_hash = generate_file_hash(pdf_path)
-    
-    # Upload PDF to S3
+
     s3_key_pdf = f"users/{user_id}/pdfs/{pdf_path.name}"
     s3_uri_pdf = upload_to_s3(pdf_path, s3_key_pdf)
     if not s3_uri_pdf:
-        print(f"Failed to upload PDF to S3")
+        print("Failed to upload PDF to S3")
         return
 
-    # Prepare data for batch upsert
     text_vectors = []
     image_vectors = []
 
     try:
         doc = fitz.open(pdf_path)
-        print(f"Processing document: {pdf_path.name}")
-        
+        print(f"Opened document: {pdf_path.name}")
+
         for page_num, page in enumerate(doc):
-            # 1. Process Text
+            # Text extraction & chunking
             page_text = page.get_text()
-            if page_text.strip():
-                text_embedding = get_text_embedding(page_text)
-                if text_embedding:
-                    vector_id = f"{user_id}_{file_hash}_text_p{page_num+1}"
+            if page_text and page_text.strip():
+                chunks = chunk_text(page_text)
+                total_chunks = len(chunks)
+                for chunk_index, chunk in enumerate(chunks):
+                    # Enrich chunk with file anchor
+                    anchored_chunk = f"Document: {pdf_path.name}\nPage: {page_num+1}\n{textwrap_short(chunk)}"
+                    emb = get_text_embedding(anchored_chunk)
+                    if not emb:
+                        continue
+                    vector_id = f"{user_id}_{file_hash}_text_p{page_num+1}_c{chunk_index}"
                     metadata = {
                         "user_id": user_id,
                         "file_name": pdf_path.name,
@@ -214,36 +269,33 @@ def process_user_files(user_id: str, pdf_path: Path):
                         "s3_uri": s3_uri_pdf,
                         "page_number": page_num + 1,
                         "type": "text",
-                        "content": page_text[:1000]  # Store preview (Pinecone metadata limit)
+                        "chunk_index": chunk_index,
+                        "total_chunks": total_chunks,
+                        "preview": chunk[:800]
                     }
-                    text_vectors.append({
-                        "id": vector_id,
-                        "values": text_embedding,
-                        "metadata": metadata
-                    })
+                    text_vectors.append({"id": vector_id, "values": emb, "metadata": metadata})
 
-            # 2. Process Images
+            # Image extraction
             for img_index, img_info in enumerate(page.get_images(full=True)):
                 xref = img_info[0]
                 base_image = doc.extract_image(xref)
-                image_bytes = base_image["image"]
-                pil_image = Image.open(io.BytesIO(image_bytes))
-                
-                # Save image temporarily
-                temp_img_path = TEMP_DIR / f"{pdf_path.stem}_p{page_num+1}_img{img_index}.png"
+                image_bytes = base_image.get("image")
+                if not image_bytes:
+                    continue
+                pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+                temp_img_name = f"{pdf_path.stem}_p{page_num+1}_img{img_index}.png"
+                temp_img_path = TEMP_DIR / temp_img_name
                 pil_image.save(temp_img_path)
-                
-                # Upload image to S3
-                s3_key_img = f"users/{user_id}/images/{temp_img_path.name}"
+
+                s3_key_img = f"users/{user_id}/images/{temp_img_name}"
                 s3_uri_img = upload_to_s3(temp_img_path, s3_key_img)
-                
-                # Get image description using Gemini
+
                 img_desc = get_image_description(pil_image)
-                
                 if img_desc and s3_uri_img:
-                    # Get embedding for the description
-                    desc_embedding = get_text_embedding(img_desc)
-                    if desc_embedding:
+                    anchored_desc = f"Document: {pdf_path.name}\nPage: {page_num+1}\n{img_desc}"
+                    desc_emb = get_text_embedding(anchored_desc)
+                    if desc_emb:
                         vector_id = f"{user_id}_{file_hash}_img_p{page_num+1}_i{img_index}"
                         metadata = {
                             "user_id": user_id,
@@ -253,137 +305,119 @@ def process_user_files(user_id: str, pdf_path: Path):
                             "s3_uri_image": s3_uri_img,
                             "page_number": page_num + 1,
                             "type": "image",
-                            "description": img_desc[:1000]  # Store preview
+                            "image_index": img_index,
+                            "description_preview": img_desc[:800]
                         }
-                        image_vectors.append({
-                            "id": vector_id,
-                            "values": desc_embedding,
-                            "metadata": metadata
-                        })
-                
-                # Clean up temp image
-                temp_img_path.unlink(missing_ok=True)
-        
+                        image_vectors.append({"id": vector_id, "values": desc_emb, "metadata": metadata})
+
+                # cleanup temp image file
+                try:
+                    temp_img_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        # close doc
         doc.close()
 
-        # Batch upsert to Pinecone
+        # Batch upsert helper
+        def batch_upsert(index, items):
+            for i in range(0, len(items), UPSERT_BATCH):
+                batch = items[i:i + UPSERT_BATCH]
+                try:
+                    index.upsert(vectors=batch, namespace=user_id)
+                except Exception as e:
+                    print(f"Error upserting batch: {e}")
+
         if text_vectors:
-            text_index.upsert(vectors=text_vectors, namespace=user_id)
-            print(f"Uploaded {len(text_vectors)} text embeddings to Pinecone")
-        
+            batch_upsert(text_index, text_vectors)
+            print(f"Uploaded {len(text_vectors)} text vectors to Pinecone")
+
         if image_vectors:
-            image_index.upsert(vectors=image_vectors, namespace=user_id)
-            print(f"Uploaded {len(image_vectors)} image embeddings to Pinecone")
-        
-        print(f"Successfully processed file for user: {user_id}")
+            batch_upsert(image_index, image_vectors)
+            print(f"Uploaded {len(image_vectors)} image vectors to Pinecone")
+
+        print(f"Finished processing file for user: {user_id}")
 
     except Exception as e:
         print(f"Error processing file for user {user_id}: {e}")
         raise
 
-def query_user_data(user_id: str, query: str):
+# small utility: shorten long text safely for anchored chunk to reduce API size
+def textwrap_short(text: str, limit: int = 2000) -> str:
+    if not text:
+        return ""
+    return text if len(text) <= limit else text[:limit] + " ..."
+
+# --- Querying pipeline ---
+def query_user_data(user_id: str, query: str, top_k: int = 10):
     """
-    Queries the user's data using Pinecone and S3.
+    Queries Pinecone (text + image indices), merges and reranks by Pinecone scores,
+    constructs a structured prompt (text + image captions + s3 links), and asks Gemini.
     """
-    query_embedding = get_text_embedding(query)
-    if not query_embedding:
+    query_emb = get_text_embedding(query)
+    if not query_emb:
         return "Error: Could not generate embedding for query."
 
     try:
-        # Query Pinecone
-        text_results = text_index.query(
-            vector=query_embedding,
-            top_k=10,  # ← Increased from 5
-            namespace=user_id,
-            include_metadata=True
-        )
-        
-        image_results = image_index.query(
-            vector=query_embedding,
-            top_k=10,  # ← Increased from 5
-            namespace=user_id,
-            include_metadata=True
-        )
-        
-        # Debug: Check if we got any results
-        print(f"Text results: {len(text_results.matches)} matches")
-        print(f"Image results: {len(image_results.matches)} matches")
-        
-        # Check if user has ANY data
+        text_results = text_index.query(vector=query_emb, top_k=top_k, namespace=user_id, include_metadata=True)
+        image_results = image_index.query(vector=query_emb, top_k=top_k, namespace=user_id, include_metadata=True)
+
+        print(f"Text matches: {len(text_results.matches)}; Image matches: {len(image_results.matches)}")
+
         if not text_results.matches and not image_results.matches:
-            return """I don't have any documents to search through yet. 
+            return ("I don't have any documents to search through yet.\n\n"
+                    "Possible reasons:\n"
+                    "1. Your document is still being processed\n"
+                    "2. No documents uploaded yet\n"
+                    "3. The document upload may have failed\n\n"
+                    "Please upload a document or try again later.")
 
-Possible reasons:
-1. Your document is still being processed (this can take 30-60 seconds)
-2. No documents have been uploaded yet
-3. The document upload may have failed
+        # Merge results and sort by score (Pinecone uses cosine; higher is more similar)
+        merged = []
+        for m in (text_results.matches or []):
+            merged.append((m.score, "text", m.metadata))
+        for m in (image_results.matches or []):
+            merged.append((m.score, "image", m.metadata))
+        merged.sort(key=lambda x: x[0], reverse=True)
 
-Please wait a moment and try again, or upload a new document."""
-        
-        # Build context from text results
-        text_contexts = []
-        for match in text_results.matches:
-            print(f"Text match score: {match.score}")  # Debug
-            if match.metadata.get('content'):
-                text_contexts.append(match.metadata['content'])
-        
-        final_context_text = "\n\n".join(text_contexts) if text_contexts else "No relevant text found."
-        
-        # Build context from image results
-        context_images = []
-        image_captions = []
-        
-        for match in image_results.matches:
-            print(f"Image match score: {match.score}")  # Debug
-            s3_uri_image = match.metadata.get('s3_uri_image')
-            description = match.metadata.get('description', '')
-            
-            if s3_uri_image:
-                s3_key = s3_uri_image.replace(f"s3://{S3_BUCKET_NAME}/", "")
-                temp_img_path = TEMP_DIR / f"query_{s3_key.split('/')[-1]}"
-                if download_from_s3(s3_key, temp_img_path):
-                    try:
-                        with Image.open(temp_img_path) as img:
-                            img_copy = img.copy()
-                        context_images.append(img_copy)
-                        image_captions.append(f"Caption: {description}\n")
-                    except Exception as e:
-                        print(f"Error opening image: {e}")
-                    finally:
-                        temp_img_path.unlink(missing_ok=True)
-        
-        # Build prompt
-        prompt_parts = [
-            """Instructions: Use the text and images provided as Context to answer the Question.
-Think thoroughly before answering. Try to provide a helpful answer even if the context is limited.
-Only respond "Not enough context to answer" if there is absolutely NO relevant information.
+        # Build final context using top N merged items
+        context_parts = []
+        for score, typ, meta in merged[:min(12, len(merged))]:
+            if typ == "text":
+                preview = meta.get("preview") or meta.get("content") or ""
+                context_parts.append(f"[Text] (score: {score:.3f}) Source: {meta.get('file_name')} - Page {meta.get('page_number')}\n{preview}")
+            else:
+                desc = meta.get("description_preview") or meta.get("description") or ""
+                s3_img = meta.get("s3_uri_image") or meta.get("s3_uri")
+                context_parts.append(f"[Image] (score: {score:.3f}) Source: {meta.get('file_name')} - Page {meta.get('page_number')}\nDescription: {desc}\nS3: {s3_img}")
 
-Context:
- - Text Context:""",
-            final_context_text,
-            " - Image Context:"
-        ]
-        
-        for img, cap in zip(context_images, image_captions):
-            prompt_parts.append(img)
-            prompt_parts.append(cap)
-        
-        prompt_parts.append(f"\nQuestion:\n{query}\n\nAnswer:")
+        final_context = "\n\n---\n\n".join(context_parts) if context_parts else "No relevant context found."
 
-        # Generate response
-        response = generation_model.generate_content(prompt_parts)
+        # Structured prompt
+        prompt = f"""
+You are InvenSight Assistant. Use only the CONTEXT below (text snippets and image descriptions) to answer the QUESTION. Try your best to answer the query. If unable to do so, say "Sorry, not able to process this query."
+
+CONTEXT:
+{final_context}
+
+QUESTION:
+{query}
+
+FINAL ANSWER:
+"""
+        # Ask Gemini
+        response = generation_model.generate_content([prompt])
         return response.text
-            
+
     except Exception as e:
         print(f"Error querying data for user {user_id}: {e}")
         return f"Error: {e}"
 
+# --- File listing & deletion (unchanged logic but robustified) ---
 def list_user_files(user_id: str) -> List[Dict]:
-    """Lists all files uploaded by a user from S3."""
     try:
         prefix = f"users/{user_id}/pdfs/"
         response = s3_client.list_objects_v2(Bucket=S3_BUCKET_NAME, Prefix=prefix)
-        
         files = []
         if 'Contents' in response:
             for obj in response['Contents']:
@@ -399,23 +433,19 @@ def list_user_files(user_id: str) -> List[Dict]:
         return []
 
 def delete_user_file(user_id: str, file_name: str):
-    """Deletes a specific file and its embeddings."""
     try:
-        # Delete PDF from S3
         s3_key = f"users/{user_id}/pdfs/{file_name}"
         s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
-        
-        # Delete associated images from S3
+
         prefix = f"users/{user_id}/images/{Path(file_name).stem}"
         response = s3_client.list_objects_v2(Bucket=S3_BUCKET_NAME, Prefix=prefix)
         if 'Contents' in response:
             for obj in response['Contents']:
                 s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=obj['Key'])
-        
-        # Delete embeddings from Pinecone (filter by file_name)
+
         text_index.delete(filter={"user_id": user_id, "file_name": file_name}, namespace=user_id)
         image_index.delete(filter={"user_id": user_id, "file_name": file_name}, namespace=user_id)
-        
+
         print(f"Deleted file {file_name} for user {user_id}")
         return True
     except Exception as e:
