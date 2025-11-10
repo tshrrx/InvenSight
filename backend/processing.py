@@ -42,7 +42,7 @@ if not S3_BUCKET_NAME:
 genai.configure(api_key=GEMINI_API_KEY)
 
 # --- Configuration ---
-GENERATION_MODEL_NAME = "gemini-1.5-flash" # FIXED: Corrected model name
+GENERATION_MODEL_NAME = "gemini-2.5-flash" # FIXED: Corrected model name
 EMBEDDING_MODEL_NAME = "models/text-embedding-004"
 EMBEDDING_DIMENSION = 768
 CHUNK_SIZE = 800
