@@ -14,7 +14,7 @@ import time
 from typing import List, Dict, BinaryIO
 
 # Install with: pip install langchain-text-splitters
-from langchain.text_splitter import RecursiveCharacterTextSplitter,Language
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # --- Load Environment Variables ---
 load_dotenv()
