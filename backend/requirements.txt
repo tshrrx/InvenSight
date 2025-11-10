@@ -10,7 +10,5 @@ pinecone==5.0.0
 langchain-text-splitters==0.2.0
 reportlab==4.0.7
 langchain
-pandas==2.1.4
 pymupdf==1.23.8
 Pillow==10.2.0
-chromadb==0.4.22
