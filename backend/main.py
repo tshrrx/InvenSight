@@ -12,7 +12,6 @@ from processing import (
     query_user_data,
     list_user_files,
     delete_user_file,
-    TEMP_DIR,
     text_index,
     image_index
 )
@@ -35,7 +34,7 @@ app.add_middleware(
 processing_status: Dict[str, str] = {}
 
 def save_upload_file_temp(upload_file: UploadFile) -> Path:
-    temp_path = TEMP_DIR / upload_file.filename
+    temp_path = Path(upload_file.filename)
     try:
         with temp_path.open("wb") as buffer:
             shutil.copyfileobj(upload_file.file, buffer)
