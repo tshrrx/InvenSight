@@ -285,31 +285,45 @@ def query_user_data(user_id: str, query: str):
     """
     Queries the user's data using Pinecone and S3.
     """
-    # Generate query embedding
     query_embedding = get_text_embedding(query)
     if not query_embedding:
         return "Error: Could not generate embedding for query."
 
     try:
-        # Query Pinecone for text
+        # Query Pinecone
         text_results = text_index.query(
             vector=query_embedding,
-            top_k=5,
+            top_k=10,  # ← Increased from 5
             namespace=user_id,
             include_metadata=True
         )
         
-        # Query Pinecone for images
         image_results = image_index.query(
             vector=query_embedding,
-            top_k=5,
+            top_k=10,  # ← Increased from 5
             namespace=user_id,
             include_metadata=True
         )
+        
+        # Debug: Check if we got any results
+        print(f"Text results: {len(text_results.matches)} matches")
+        print(f"Image results: {len(image_results.matches)} matches")
+        
+        # Check if user has ANY data
+        if not text_results.matches and not image_results.matches:
+            return """I don't have any documents to search through yet. 
+
+Possible reasons:
+1. Your document is still being processed (this can take 30-60 seconds)
+2. No documents have been uploaded yet
+3. The document upload may have failed
+
+Please wait a moment and try again, or upload a new document."""
         
         # Build context from text results
         text_contexts = []
         for match in text_results.matches:
+            print(f"Text match score: {match.score}")  # Debug
             if match.metadata.get('content'):
                 text_contexts.append(match.metadata['content'])
         
@@ -320,19 +334,17 @@ def query_user_data(user_id: str, query: str):
         image_captions = []
         
         for match in image_results.matches:
+            print(f"Image match score: {match.score}")  # Debug
             s3_uri_image = match.metadata.get('s3_uri_image')
             description = match.metadata.get('description', '')
             
             if s3_uri_image:
-                # Extract S3 key from URI
                 s3_key = s3_uri_image.replace(f"s3://{S3_BUCKET_NAME}/", "")
-                
-                # Download image from S3 temporarily
                 temp_img_path = TEMP_DIR / f"query_{s3_key.split('/')[-1]}"
                 if download_from_s3(s3_key, temp_img_path):
                     try:
                         with Image.open(temp_img_path) as img:
-                            img_copy = img.copy()  # Copy to memory
+                            img_copy = img.copy()
                         context_images.append(img_copy)
                         image_captions.append(f"Caption: {description}\n")
                     except Exception as e:
@@ -340,10 +352,11 @@ def query_user_data(user_id: str, query: str):
                     finally:
                         temp_img_path.unlink(missing_ok=True)
         
-        # Build prompt for Gemini
+        # Build prompt
         prompt_parts = [
             """Instructions: Use the text and images provided as Context to answer the Question.
-Think thoroughly before answering. If unsure, respond, "Not enough context to answer".
+Think thoroughly before answering. Try to provide a helpful answer even if the context is limited.
+Only respond "Not enough context to answer" if there is absolutely NO relevant information.
 
 Context:
  - Text Context:""",
@@ -351,21 +364,15 @@ Context:
             " - Image Context:"
         ]
         
-        # Add images and captions
         for img, cap in zip(context_images, image_captions):
             prompt_parts.append(img)
             prompt_parts.append(cap)
         
-        # Add the query
         prompt_parts.append(f"\nQuestion:\n{query}\n\nAnswer:")
 
         # Generate response
-        try:
-            response = generation_model.generate_content(prompt_parts)
-            return response.text
-        except Exception as e:
-            print(f"Error generating final response: {e}")
-            return f"Error: {e}"
+        response = generation_model.generate_content(prompt_parts)
+        return response.text
             
     except Exception as e:
         print(f"Error querying data for user {user_id}: {e}")

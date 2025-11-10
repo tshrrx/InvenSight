@@ -2,7 +2,8 @@
 
 import { useState, useRef, useEffect } from "react";
 import Aurora from "../components/Aurora";
-import { Upload, Send, X } from "lucide-react";
+import { Upload, Send, X, Loader2, AlertCircle } from "lucide-react";
+import { api } from "./apiservice";
 
 interface Message {
   id: string;
@@ -16,8 +17,21 @@ export default function MainPage() {
   const [input, setInput] = useState("");
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [userId, setUserId] = useState<string>("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Generate or retrieve user ID
+  useEffect(() => {
+    let storedUserId = localStorage.getItem("invensight_user_id");
+    if (!storedUserId) {
+      storedUserId = `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      localStorage.setItem("invensight_user_id", storedUserId);
+    }
+    setUserId(storedUserId);
+  }, []);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -27,19 +41,73 @@ export default function MainPage() {
     scrollToBottom();
   }, [messages]);
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file && file.type === "application/pdf") {
+    if (!file) return;
+
+    if (file.type !== "application/pdf") {
+      setError("Please upload a PDF file");
+      return;
+    }
+
+    setError(null);
+    setIsUploading(true);
+
+    try {
+      // Upload to backend
+      const response = await api.uploadPDF(userId, file);
       setUploadedFile(file);
-    } else {
-      alert("Please upload a PDF file");
+      
+      // Show uploading message
+      const uploadingMessage: Message = {
+        id: Date.now().toString(),
+        role: "assistant",
+        content: `📄 ${response.filename} uploaded! Processing... Please wait.`,
+        timestamp: new Date(),
+      };
+      setMessages([uploadingMessage]);
+      
+      // Poll for completion
+      let attempts = 0;
+      const maxAttempts = 60; // 60 seconds max wait
+      
+      const checkStatus = setInterval(async () => {
+        attempts++;
+        const status = await api.checkUploadStatus(userId, file.name);
+        
+        if (status.status === "completed") {
+          clearInterval(checkStatus);
+          const readyMessage: Message = {
+            id: (Date.now() + 1).toString(),
+            role: "assistant",
+            content: `✅ ${file.name} is ready! You can now ask questions about the document.`,
+            timestamp: new Date(),
+          };
+          setMessages([readyMessage]);
+          setIsUploading(false);
+        } else if (status.status.startsWith("failed")) {
+          clearInterval(checkStatus);
+          setError(`Processing failed: ${status.status}`);
+          setIsUploading(false);
+        } else if (attempts >= maxAttempts) {
+          clearInterval(checkStatus);
+          setError("Processing is taking longer than expected. Please try querying anyway.");
+          setIsUploading(false);
+        }
+      }, 1000); // Check every second
+    
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Upload failed");
+      setUploadedFile(null);
+      setIsUploading(false);
     }
   };
 
   const removeFile = () => {
     setUploadedFile(null);
-    setMessages([]); // Clear conversation when PDF is removed
-    setInput(""); // Clear input
+    setMessages([]);
+    setInput("");
+    setError(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -47,7 +115,7 @@ export default function MainPage() {
 
   const handleSendMessage = async () => {
     if (!uploadedFile) {
-      alert("Please upload a PDF file first to start the conversation");
+      setError("Please upload a PDF file first to start the conversation");
       return;
     }
 
@@ -63,18 +131,50 @@ export default function MainPage() {
     setMessages((prev) => [...prev, userMessage]);
     setInput("");
     setIsLoading(true);
+    setError(null);
 
-    // Simulate API response
-    setTimeout(() => {
+    try {
+      const response = await api.query(userId, input);
+      
+      // Check if it's a "processing" response
+      if (response.answer.includes("still being processed")) {
+        const retryMessage: Message = {
+          id: (Date.now() + 1).toString(),
+          role: "assistant",
+          content: response.answer + "\n\n⏳ Retrying in 5 seconds...",
+          timestamp: new Date(),
+        };
+        setMessages((prev) => [...prev, retryMessage]);
+        
+        // Auto-retry after 5 seconds
+        setTimeout(() => {
+          setInput(input); // Restore the query
+          handleSendMessage(); // Retry
+        }, 5000);
+        
+        return;
+      }
+      
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: "assistant",
-        content: "This is a simulated response. Connect your backend API here.",
+        content: response.answer,
         timestamp: new Date(),
       };
       setMessages((prev) => [...prev, assistantMessage]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Query failed");
+      
+      const errorMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        role: "assistant",
+        content: "Sorry, I encountered an error. Please try again in a moment.",
+        timestamp: new Date(),
+      };
+      setMessages((prev) => [...prev, errorMessage]);
+    } finally {
       setIsLoading(false);
-    }, 1000);
+    }
   };
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
@@ -138,7 +238,26 @@ export default function MainPage() {
               <p className="text-gray-300 text-sm">
                 Upload a PDF and start your conversation
               </p>
+              {userId && (
+                <p className="text-gray-500 text-xs mt-1">
+                  Session ID: {userId.slice(0, 20)}...
+                </p>
+              )}
             </div>
+
+            {/* Error Alert */}
+            {error && (
+              <div className="mb-4 bg-red-500/10 border border-red-500/50 rounded-lg p-3 flex items-center gap-2">
+                <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0" />
+                <p className="text-red-300 text-sm">{error}</p>
+                <button
+                  onClick={() => setError(null)}
+                  className="ml-auto text-red-400 hover:text-red-300"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            )}
 
             {/* Chat Container */}
             <div className="flex-1 overflow-hidden bg-white/5 backdrop-blur-lg rounded-2xl border border-white/10 shadow-2xl flex flex-col">
@@ -147,12 +266,21 @@ export default function MainPage() {
                 {messages.length === 0 ? (
                   <div className="flex items-center justify-center h-full">
                     <div className="text-center text-gray-400">
-                      <Upload className="w-16 h-16 mx-auto mb-4 opacity-50" />
-                      <p className="text-lg">
-                        {uploadedFile
-                          ? "Start your conversation"
-                          : "Upload PDF"}
-                      </p>
+                      {isUploading ? (
+                        <>
+                          <Loader2 className="w-16 h-16 mx-auto mb-4 opacity-50 animate-spin" />
+                          <p className="text-lg">Uploading PDF...</p>
+                        </>
+                      ) : (
+                        <>
+                          <Upload className="w-16 h-16 mx-auto mb-4 opacity-50" />
+                          <p className="text-lg">
+                            {uploadedFile
+                              ? "Start your conversation"
+                              : "Upload a PDF to begin"}
+                          </p>
+                        </>
+                      )}
                     </div>
                   </div>
                 ) : (
@@ -229,13 +357,20 @@ export default function MainPage() {
                     onChange={handleFileUpload}
                     className="hidden"
                     id="pdf-upload"
+                    disabled={isUploading}
                   />
                   <label
                     htmlFor="pdf-upload"
-                    className="cursor-pointer bg-white/10 hover:bg-white/20 transition-colors rounded-xl p-3 border border-white/20"
+                    className={`cursor-pointer bg-white/10 hover:bg-white/20 transition-colors rounded-xl p-3 border border-white/20 ${
+                      isUploading ? "opacity-50 cursor-not-allowed" : ""
+                    }`}
                     title="Upload PDF"
                   >
-                    <Upload className="w-5 h-5 text-white" />
+                    {isUploading ? (
+                      <Loader2 className="w-5 h-5 text-white animate-spin" />
+                    ) : (
+                      <Upload className="w-5 h-5 text-white" />
+                    )}
                   </label>
 
                   <textarea
@@ -247,20 +382,24 @@ export default function MainPage() {
                         ? "Type your message..."
                         : "Upload a PDF first..."
                     }
-                    disabled={!uploadedFile}
+                    disabled={!uploadedFile || isLoading}
                     className={`flex-1 bg-white/10 text-white placeholder-gray-400 rounded-xl px-4 py-3 border border-white/20 focus:outline-none focus:border-blue-400 resize-none max-h-32 custom-scrollbar ${
-                      !uploadedFile ? "opacity-50 cursor-not-allowed" : ""
+                      !uploadedFile || isLoading ? "opacity-50 cursor-not-allowed" : ""
                     }`}
                     rows={1}
                   />
 
                   <button
                     onClick={handleSendMessage}
-                    disabled={!input.trim() || !uploadedFile}
+                    disabled={!input.trim() || !uploadedFile || isLoading}
                     className="bg-blue-500 hover:bg-blue-600 disabled:bg-gray-600 disabled:cursor-not-allowed transition-colors rounded-xl p-3"
                     title={!uploadedFile ? "Upload a PDF first" : "Send message"}
                   >
-                    <Send className="w-5 h-5 text-white" />
+                    {isLoading ? (
+                      <Loader2 className="w-5 h-5 text-white animate-spin" />
+                    ) : (
+                      <Send className="w-5 h-5 text-white" />
+                    )}
                   </button>
                 </div>
               </div>
