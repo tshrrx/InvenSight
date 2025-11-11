@@ -42,13 +42,14 @@ if not S3_BUCKET_NAME:
 genai.configure(api_key=GEMINI_API_KEY)
 
 # --- Configuration ---
-GENERATION_MODEL_NAME = "gemini-2.5-flash" # FIXED: Corrected model name
-EMBEDDING_MODEL_NAME = "models/text-embedding-004"
+GENERATION_MODEL_NAME = "gemini-2.5-flash"
+EMBEDDING_MODEL_NAME = "models/text-embedding-005"
 EMBEDDING_DIMENSION = 768
-CHUNK_SIZE = 800
-CHUNK_OVERLAP = 150
+CHUNK_SIZE = 1000  # Increased for more context per chunk
+CHUNK_OVERLAP = 200  # Increased overlap to maintain continuity
 UPSERT_BATCH = 100
-FINAL_QUERY_TOP_K = 12      # How many results to finally use in the context
+FINAL_QUERY_TOP_K = 50  # Retrieve top 50 most relevant chunks
+SIMILARITY_THRESHOLD = 0.30  # Minimum relevance score
 
 # Local data directory (e.g., for uploads)
 DATA_DIR = Path(os.getenv("DATA_DIR", "."))
@@ -380,16 +381,18 @@ def query_user_data(user_id: str, query: str, top_k: int = FINAL_QUERY_TOP_K):
         return "Error: Could not generate embedding for query."
 
     try:
-        # FIXED: Query both indexes for the *full* amount (top_k)
+        # Retrieve large number of chunks (Gemini 2.5 Flash can handle it)
+        MAX_RETRIEVAL = 200  # Increased significantly
+        
         text_results = text_index.query(
             vector=query_emb, 
-            top_k=top_k, 
+            top_k=MAX_RETRIEVAL, 
             namespace=user_id, 
             include_metadata=True
         )
         image_results = image_index.query(
             vector=query_emb, 
-            top_k=top_k, 
+            top_k=MAX_RETRIEVAL, 
             namespace=user_id, 
             include_metadata=True
         )
@@ -403,20 +406,29 @@ def query_user_data(user_id: str, query: str, top_k: int = FINAL_QUERY_TOP_K):
                     "2. You haven't uploaded any documents yet.\n"
                     "3. The query doesn't match your document content.")
 
-        # Merge results and sort by score
+        # Merge results and filter by similarity threshold
         merged = []
-        for m in (text_results.matches or []):
-            merged.append((m.score, "text", m.metadata))
-        for m in (image_results.matches or []):
-            merged.append((m.score, "image", m.metadata))
         
-        # Sort by score (descending) to get the most relevant items
+        for m in (text_results.matches or []):
+            if m.score >= SIMILARITY_THRESHOLD:
+                merged.append((m.score, "text", m.metadata))
+        
+        for m in (image_results.matches or []):
+            if m.score >= SIMILARITY_THRESHOLD:
+                merged.append((m.score, "image", m.metadata))
+        
+        # Sort by score (descending)
         merged.sort(key=lambda x: x[0], reverse=True)
+        
+        # Apply top_k limit if specified, otherwise use all
+        if top_k:
+            merged = merged[:top_k]
+        
+        print(f"Using {len(merged)} chunks for context")
 
-        # Build final context using top N merged items
+        # Build comprehensive context
         context_parts = []
-        # FIXED: Slice the *merged and sorted* list to get the absolute best results
-        for score, typ, meta in merged[:top_k]:
+        for score, typ, meta in merged:
             if typ == "text":
                 preview = meta.get("preview") or ""
                 context_parts.append(
@@ -436,22 +448,36 @@ def query_user_data(user_id: str, query: str, top_k: int = FINAL_QUERY_TOP_K):
 
         final_context = "\n\n---\n\n".join(context_parts)
 
-        # FIXED: Stricter prompt for better RAG performance
+        # Enhanced prompt for comprehensive analysis
         prompt = f"""
-You are an assistant. Your task is to answer the user's QUESTION based *only* on the provided CONTEXT.
-Do not use any outside knowledge.
-If the answer is not contained within the CONTEXT, state: "I could not find an answer to that in the provided documents."
+You are an assistant analyzing a comprehensive set of document excerpts.
 
-CONTEXT:
+Your task is to answer the user's QUESTION based *only* on the provided CONTEXT.
+
+INSTRUCTIONS:
+- You have access to {len(context_parts)} relevant chunks from the document(s)
+- Synthesize information across ALL provided chunks to give a complete answer
+- If the question asks about trends, patterns, or multi-page information, connect insights from different chunks
+- Cite specific page numbers when providing factual details
+- Do not use any outside knowledge
+- If the answer requires information not in the CONTEXT, state: "I could not find an answer to that in the provided documents."
+
+CONTEXT ({len(context_parts)} chunks):
 {final_context}
 
 QUESTION:
 {query}
 
-FINAL ANSWER:
+COMPREHENSIVE ANSWER:
 """
-        # Ask Gemini
-        response = generation_model.generate_content([prompt])
+        # Ask Gemini with extended configuration
+        response = generation_model.generate_content(
+            [prompt],
+            generation_config={
+                "temperature": 0.3,  # Lower temperature for factual responses
+                "max_output_tokens": 2048,  # Allow longer responses
+            }
+        )
         return response.text
 
     except Exception as e:
